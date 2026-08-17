@@ -45,6 +45,17 @@ class Branding(Strict):
     categorical: tuple[str, ...] = ("#35424D", "#B06E4F", "#5E8B7E", "#8A7E6D", "#6B7A8F")
     serif: str = "Georgia, 'Times New Roman', serif"
 
+    # Chart text and the page behind it. These were hardcoded in the app for one
+    # deployment's palette, so a second deployment rendered its axis labels and
+    # legends in the first one's warm grey — legible, but visibly the wrong hue,
+    # and not something a config-driven theme should be unable to change.
+    ink: str = "#DED8CE"
+    # A benchmark is deliberately not one of the categorical series colours. A
+    # portfolio and the thing it is measured against should not look like two
+    # members of the same set, and a palette built from one hue cannot separate
+    # three lines on a dark ground by brightness alone.
+    benchmark: str = "#7E97A6"
+
     @model_validator(mode="after")
     def _colours_are_hex(self) -> Branding:
         named = {
@@ -119,6 +130,12 @@ class InstrumentKind(StrEnum):
     FUND = "fund"
     CASH = "cash"
     PRIVATE = "private"
+    # Directly-held crypto, as distinct from a fund that holds it. It is quotable
+    # (so not `private`) but it is not a fund and owns no companies, and calling
+    # it an ETF would be the kind of small inaccuracy this schema exists to
+    # prevent. Behaviour is unaffected — `kind` is a label, and the analytics
+    # exclusion is driven by `asset_class`.
+    CRYPTO = "crypto"
 
 
 class Instrument(Strict):
@@ -146,8 +163,14 @@ class Instrument(Strict):
 
 
 class Comparator(Strict):
+    """A series to draw alongside the portfolio on the performance chart."""
+
     label: str
     symbol: str
+    # Declared, never inferred from the symbol suffix — the same rule the
+    # instrument list follows. None means it is already in the base currency, so a
+    # Canadian investor comparing against CAD-listed proxies needs no FX at all.
+    currency: str | None = None
 
 
 class Benchmarks(Strict):

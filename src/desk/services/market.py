@@ -363,6 +363,113 @@ def build_snapshot(
     return outcome
 
 
+# Slot marking a reconstructed point: market value implied by past prices for the
+# units held *today*, not something anybody observed at the time.
+#
+# Carried in `slot` rather than a new column deliberately. This project has no
+# migration files yet, so `create_all` cannot add a column to a table that already
+# exists in a deployed database — an ALTER TABLE by hand against live data is a
+# worse risk than reusing a key that is already part of the primary key and
+# already sized for it. Every existing query filters `slot == "close"`, so these
+# rows are invisible to anything that has not opted in.
+RECONSTRUCTED = "recon"
+
+
+def reconstruct_history(
+    cfg: object,
+    database_url: str,
+    *,
+    period: str = "5y",
+    freq: str = "W-FRI",
+) -> tuple[int, dt.date, dt.date] | None:
+    """Fill the performance chart from price history. Returns (rows, first, last).
+
+    The chart otherwise starts empty and takes two trading days to draw its first
+    line, and months to be worth looking at. This values the units held *today*
+    at each past date, which is a backtest of the current book rather than a record
+    of what was actually held — a lot bought last month is projected backwards as
+    though it had always been there.
+
+    That makes these rows a different kind of fact from a recorded snapshot, and
+    they are stored under their own slot so nothing conflates the two. Book value is
+    deliberately left null: the ledger cannot say what the cost base was at each
+    past date without trade dates for every lot, and a flat line at today's book
+    would assert there had been no contributions.
+
+    Weekly by default. Daily adds five times the rows to say the same thing on a
+    multi-year chart.
+    """
+    from desk.analytics.positions import build_ledger
+    from desk.services import portfolio as portfolio_service
+
+    loaded = portfolio_service.load(database_url)
+    result = build_ledger(loaded.entries)
+    if not result.positions:
+        return None
+
+    base = cfg.locale.base_currency  # type: ignore[attr-defined]
+    held = [p.ticker for p in result.positions]
+    symbols, currencies = instrument_maps(cfg.instruments, held)  # type: ignore[attr-defined]
+    if not symbols:
+        return None
+    history = base_history(symbols, currencies, base, period)
+    if history.empty:
+        return None
+
+    units: dict[str, float] = {}
+    for position in result.positions:
+        units[position.ticker] = units.get(position.ticker, 0.0) + position.quantity
+    columns = [c for c in history.columns if c in units]
+    if not columns:
+        return None
+
+    # Every held name must be priced on a date for its total to mean anything;
+    # a date missing one holding would dip the whole series.
+    aligned = history[columns].dropna()
+    if aligned.empty:
+        return None
+    values = (aligned * pd.Series({c: units[c] for c in columns})).sum(axis=1)
+    sampled = values.resample(freq).last().dropna() if freq else values
+
+    engine = build_engine(database_url)
+    create_all(engine)
+    factory = session_factory(engine)
+    with session_scope(factory) as s:
+        for stamp, amount in sampled.items():
+            s.merge(
+                Snapshot(
+                    date=stamp.date() if hasattr(stamp, "date") else stamp,
+                    slot=RECONSTRUCTED,
+                    market_value=float(amount),
+                    book_value=None,
+                    cash_value=None,
+                    price_coverage=1.0,
+                )
+            )
+    index = pd.DatetimeIndex(sampled.index)
+    return len(sampled), index.min().date(), index.max().date()
+
+
+def comparator_history(
+    comparators: Sequence[tuple[str, str, str]],
+    base: str,
+    period: str = "5y",
+) -> dict[str, pd.Series]:
+    """Price history per comparator label, converted into base currency.
+
+    Each entry is (label, symbol, currency); an empty currency means the series is
+    already in base. Reuses `base_history`, so a comparator quoted in a foreign
+    currency carries the same FX treatment as a holding — the return a base-currency
+    investor would actually have experienced, currency move included.
+    """
+    if not comparators:
+        return {}
+    symbols = {label: symbol for label, symbol, _ in comparators}
+    currencies = {label: (currency or base) for label, _, currency in comparators}
+    frame = base_history(symbols, currencies, base, period)
+    return {label: frame[label].dropna() for label in frame.columns}
+
+
 def read_snapshots(database_url: str) -> pd.DataFrame:
     """Every recorded snapshot, one row per date+slot, oldest first."""
     engine = build_engine(database_url)

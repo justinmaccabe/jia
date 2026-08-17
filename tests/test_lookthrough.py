@@ -14,6 +14,7 @@ import pytest
 
 from desk.analytics.lookthrough import (
     COMMODITY,
+    DIRECT,
     SYNTHETIC,
     FundComposition,
     Holding,
@@ -291,3 +292,122 @@ class TestEmptyInputs:
         )
         assert report.total == pytest.approx(100.0)
         assert "ZERO" not in report.unresolved
+
+
+class TestPartialCompositions:
+    """A fact sheet publishes a fund's largest holdings, not all of them.
+
+    The distinction between "the fund holds 2% cash" and "we can see 10 of its 506
+    holdings" is invisible in the weights alone, and getting it wrong reports a
+    diversified equity fund as two-thirds uninvested. That is not a cosmetic error:
+    the asset mix, the coverage figure and every concentration statistic are read
+    against it.
+    """
+
+    def test_uncovered_weight_is_unresolved_not_cash(self) -> None:
+        report = look_through(
+            {"AAA": 1000.0},
+            [fund("AAA", [equity("RY", 0.10), equity("TD", 0.08)], total_holdings=500)],
+        )
+        assert report.asset["Unresolved inside funds"] == pytest.approx(0.82)
+        assert "Cash" not in report.asset
+
+    def test_a_complete_list_still_yields_cash(self) -> None:
+        """The complete case must not regress: there `total_holdings` is None."""
+        report = look_through({"AAA": 1000.0}, [fund("AAA", [equity("RY", 0.98)])])
+        assert report.asset["Cash"] == pytest.approx(0.02)
+        assert "Unresolved inside funds" not in report.asset
+
+    def test_coverage_counts_only_the_published_portion(self) -> None:
+        report = look_through(
+            {"AAA": 1000.0},
+            [fund("AAA", [equity("RY", 0.30)], total_holdings=500)],
+        )
+        assert report.coverage == pytest.approx(0.30)
+
+    def test_partial_funds_are_reported_with_their_counts(self) -> None:
+        report = look_through(
+            {"AAA": 1000.0},
+            [fund("AAA", [equity("RY", 0.30)], total_holdings=506)],
+        )
+        value, shown, held = report.partial["AAA"]
+        assert (value, shown, held) == (pytest.approx(1000.0), 1, 506)
+        assert report.stats_are_lower_bounds
+
+    def test_a_complete_book_is_not_flagged_as_a_lower_bound(self) -> None:
+        report = look_through({"AAA": 1000.0}, [fund("AAA", [equity("RY", 1.0)])])
+        assert not report.stats_are_lower_bounds
+        assert not report.partial
+
+    def test_a_list_covering_the_whole_fund_is_not_partial(self) -> None:
+        """total_holdings equal to the rows published means the list is complete."""
+        report = look_through(
+            {"AAA": 1000.0},
+            [fund("AAA", [equity("RY", 0.6), equity("TD", 0.4)], total_holdings=2)],
+        )
+        assert not report.partial
+        assert report.coverage == pytest.approx(1.0)
+
+    def test_asset_mix_still_sums_to_one_with_partial_funds(self) -> None:
+        report = look_through(
+            {"AAA": 600.0, "BBB": 400.0},
+            [
+                fund("AAA", [equity("RY", 0.30)], total_holdings=500),
+                fund("BBB", [equity("TD", 0.95)]),
+            ],
+        )
+        assert sum(report.asset.values()) == pytest.approx(1.0)
+
+
+class TestDirectHoldings:
+    """A directly-held share is a company and resolves to itself.
+
+    This is what makes the most easily missed overlap visible: a name owned
+    outright that also sits inside a fund appears once, with both contributions
+    summed. No brokerage statement puts those two numbers together.
+    """
+
+    def test_a_direct_holding_becomes_its_own_company(self) -> None:
+        direct = FundComposition(
+            ticker="NVDA",
+            name="NVIDIA Corp",
+            resolution=DIRECT,
+            holdings=(
+                Holding(
+                    ticker="NVDA",
+                    name="NVIDIA Corp",
+                    weight=1.0,
+                    sector="Information Technology",
+                    country="United States",
+                ),
+            ),
+        )
+        report = look_through({"NVDA": 1000.0}, [direct])
+        assert [c.ticker for c in report.companies] == ["NVDA"]
+        assert report.coverage == pytest.approx(1.0)
+        assert report.asset["Public equity"] == pytest.approx(1.0)
+
+    def test_direct_and_fund_exposure_to_one_name_are_summed(self) -> None:
+        direct = FundComposition(
+            ticker="NVDA",
+            resolution=DIRECT,
+            holdings=(
+                Holding(
+                    ticker="NVDA",
+                    name="NVIDIA Corp",
+                    weight=1.0,
+                    sector="Information Technology",
+                    country="United States",
+                ),
+            ),
+        )
+        etf = fund(
+            "SPMO",
+            [equity("NVDA", 0.075, sector="Information Technology", country="United States")],
+            total_holdings=99,
+        )
+        report = look_through({"NVDA": 1000.0, "SPMO": 2000.0}, [direct, etf])
+        nvda = next(c for c in report.companies if c.ticker == "NVDA")
+        assert nvda.total == pytest.approx(1150.0)  # 1000 direct + 150 via the fund
+        assert nvda.funds == 2
+        assert set(nvda.by_fund) == {"NVDA", "SPMO"}

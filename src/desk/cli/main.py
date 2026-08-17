@@ -233,7 +233,7 @@ def backfill(
     from pathlib import Path
 
     import yaml
-    from sqlalchemy import delete
+    from sqlalchemy import delete, select
 
     from desk.domain.types import Action
     from desk.store.engine import build_engine, create_all, session_factory, session_scope
@@ -266,7 +266,20 @@ def backfill(
                     kind=inst.kind.value,
                 )
             )
-        # opening lots
+        # Existing opening lots, keyed two ways: by content hash to recognise an
+        # unchanged row, and by (account, ticker) to recognise a changed one.
+        #
+        # `merge` cannot do this. It matches on the primary key, which here is an
+        # autoincrement id nobody supplies, so every call is an INSERT — which then
+        # collides with the unique index on source_hash. The idempotency this
+        # command has always claimed was never actually implemented.
+        existing = (
+            s.execute(select(Transaction).where(Transaction.note == "opening lot")).scalars().all()
+        )
+        seen_hashes = {t.source_hash for t in existing}
+        seen_lots = {(t.account_id, t.ticker): t.source_hash for t in existing}
+
+        unchanged, inserted, conflicts = 0, 0, []
         for h in spec.get("holdings", []):
             units = float(h["units"])
             book_native = float(h["book_native"])
@@ -276,7 +289,19 @@ def backfill(
             digest = hashlib.sha256(
                 f"open|{h['account']}|{h['ticker']}|{units}|{book_native}".encode()
             ).hexdigest()
-            s.merge(
+            entries.append((h["ticker"], h["account"], units, unit_cost, fx, ccy))
+
+            if digest in seen_hashes:
+                unchanged += 1
+                continue
+            prior = seen_lots.get((h["account"], h["ticker"]))
+            if prior is not None and prior != digest:
+                # Inserting would leave both lots in the ledger and double the
+                # position — silently, and in the direction that flatters the
+                # portfolio. Refuse and name the flag that does the right thing.
+                conflicts.append(str(h["ticker"]))
+                continue
+            s.add(
                 Transaction(
                     date=as_of,
                     ticker=h["ticker"],
@@ -290,16 +315,39 @@ def backfill(
                     note="opening lot",
                 )
             )
-            entries.append((h["ticker"], h["account"], units, unit_cost, fx, ccy))
+            inserted += 1
+
+        if conflicts:
+            console.print(
+                f"[red]{', '.join(conflicts)} already have an opening lot with different "
+                "units or cost.\n"
+                "  Loading these would add a second lot and double the position rather "
+                "than correct it.\n"
+                "  Re-run with [bold]--reset[/bold] to replace the opening ledger."
+            )
+            raise typer.Exit(1)
         # cash and contributions
         for c in spec.get("cash", []):
             s.merge(
                 Cash(account_id=c["account"], currency=c["currency"], amount=float(c["amount"]))
             )
+        # Deduplicated on the natural key. ContributionRow's primary key is an
+        # autoincrement id and it carries no unique constraint, so `merge` inserted
+        # a fresh row on every run — silently, with nothing to collide against.
+        # Duplicated contributions overstate room used, which is the direction that
+        # wrongly reports someone as over-contributed.
+        known = {
+            (r.date, r.account_id, round(r.amount, 6), r.kind)
+            for r in s.execute(select(ContributionRow)).scalars()
+        }
         for c in spec.get("contributions", []):
             d = c["date"]
             d = _dt.date.fromisoformat(d) if isinstance(d, str) else d
-            s.merge(
+            key = (d, c["account"], round(float(c["amount"]), 6), "contribution")
+            if key in known:
+                continue
+            known.add(key)
+            s.add(
                 ContributionRow(
                     date=d,
                     account_id=c["account"],
@@ -334,6 +382,8 @@ def backfill(
     for p in rolled:
         table.add_row(p.ticker, f"{p.quantity:,.2f}", f"{p.book_value_base:,.2f}")
     console.print(table)
+    if unchanged:
+        console.print(f"[dim]{inserted} lot(s) loaded, {unchanged} already present and unchanged.")
     total = sum(p.book_value_base for p in rolled)
     console.print(
         f"\n[bold]book value[/bold]  {total:>14,.2f} CAD across "
@@ -436,6 +486,164 @@ def fetch_prices(
             f"[yellow]\nonly {outcome.coverage:.0%} of book value carried a live price. "
             "The snapshot is stored with its coverage so the gap stays visible."
         )
+
+
+@app.command()
+def status(
+    db: str = typer.Option(None, "--db", help="database URL; defaults to DESK_DATABASE_URL"),
+) -> None:
+    """Report what is actually in the database.
+
+    Exists because every other command is quiet on success, which makes "did that
+    work?" a question you cannot answer without opening a SQL client. This reads
+    only, changes nothing, and prints the counts that determine what the dashboard
+    can show.
+    """
+    from sqlalchemy import func, select
+
+    from desk.store.engine import build_engine, create_all, session_factory, session_scope
+    from desk.store.models import (
+        AppConfig,
+        Cash,
+        ContributionRow,
+        Instrument,
+        Snapshot,
+        Transaction,
+    )
+
+    url = db
+    if not url:
+        from desk.settings import SettingsError, get_settings
+
+        try:
+            settings = get_settings()
+        except SettingsError as exc:
+            console.print(f"[red]{exc}")
+            raise typer.Exit(1) from exc
+        if settings.database_url is None:
+            console.print("[red]no --db given and DESK_DATABASE_URL is not set.")
+            raise typer.Exit(1)
+        url = settings.database_url.get_secret_value()
+
+    engine = build_engine(url)
+    create_all(engine)
+    factory = session_factory(engine)
+    table = Table(title="desk status", show_header=True, header_style="bold")
+    table.add_column("what")
+    table.add_column("state", overflow="fold")
+
+    with session_scope(factory) as s:
+
+        def count(model: type[Any]) -> int:
+            return int(s.execute(select(func.count()).select_from(model)).scalar() or 0)
+
+        config_row = s.get(AppConfig, 1)
+        table.add_row(
+            "config row",
+            "present — the dashboard reads its accounts and instruments from here"
+            if config_row
+            else "[yellow]missing — run `desk push-config`",
+        )
+        table.add_row("instruments", f"{count(Instrument)} rows")
+
+        positions = list(s.execute(select(Transaction)).scalars())
+        if positions:
+            tickers = len({t.ticker for t in positions})
+            accounts = len({t.account_id for t in positions})
+            table.add_row(
+                "ledger", f"{len(positions)} rows over {tickers} tickers, {accounts} account(s)"
+            )
+        else:
+            table.add_row("ledger", "[yellow]empty — run `desk backfill`")
+
+        table.add_row("cash rows", f"{count(Cash)}")
+        table.add_row("contributions", f"{count(ContributionRow)}")
+
+        snaps = list(s.execute(select(Snapshot).order_by(Snapshot.date)).scalars())
+        recorded = [x for x in snaps if x.slot != "recon"]
+        recon = [x for x in snaps if x.slot == "recon"]
+        if recorded:
+            table.add_row(
+                "recorded snapshots",
+                f"{len(recorded)} — {recorded[0].date} to {recorded[-1].date}. "
+                "The performance chart draws a line from two or more.",
+            )
+        else:
+            table.add_row(
+                "recorded snapshots",
+                "[yellow]none — press Fetch prices, or let the daily job run",
+            )
+        if recon:
+            table.add_row(
+                "reconstructed", f"{len(recon)} — {recon[0].date} to {recon[-1].date} (dashed line)"
+            )
+        else:
+            table.add_row("reconstructed", "[dim]none — run `desk backfill-snapshots`")
+
+    console.print(table)
+    console.print("[dim]Read-only. Nothing was changed.")
+
+
+@app.command("backfill-snapshots")
+def backfill_snapshots(
+    db: str = typer.Option(None, "--db", help="database URL; defaults to DESK_DATABASE_URL"),
+    config: str = typer.Option(None, "--config", "-c", help="path to portfolio.yaml"),
+    period: str = typer.Option("5y", "--period", help="how far back to reconstruct"),
+    freq: str = typer.Option("W-FRI", "--freq", help="sampling frequency, e.g. W-FRI or B"),
+) -> None:
+    """Fill the performance chart from price history.
+
+    A new deployment has no snapshots, so the chart needs two trading days to draw
+    a line and months before it says anything. This values the units held today at
+    each past date and stores the result.
+
+    These are reconstructed points, not observations: a lot bought last month is
+    projected backwards as though it had always been held. They are written under
+    their own slot so nothing confuses them with recorded snapshots, and the chart
+    draws them as a separate, dashed series.
+    """
+    from desk.services.market import reconstruct_history
+
+    # `--db` like every other local command here. Only `fetch-prices` insists on the
+    # environment, because that one runs in CI where a connection string in argv
+    # lands in a log; a command typed at a prompt is better served by not needing a
+    # three-variable prefix that truncates when the line wraps.
+    db_url = db
+    if not db_url:
+        from desk.settings import SettingsError, get_settings
+
+        try:
+            settings = get_settings()
+        except SettingsError as exc:
+            console.print(f"[red]{exc}")
+            raise typer.Exit(1) from exc
+        if settings.database_url is None:
+            console.print("[red]no --db given and DESK_DATABASE_URL is not set.")
+            raise typer.Exit(1)
+        db_url = settings.database_url.get_secret_value()
+
+    def _db_config() -> Mapping[str, Any] | None:
+        from desk.services.portfolio import load_config_payload
+
+        return load_config_payload(db_url)
+
+    try:
+        cfg = load(config, db_fallback=_db_config)
+    except ConfigError as exc:
+        console.print(f"[red]{exc}")
+        raise typer.Exit(1) from exc
+
+    with console.status("fetching price history…"):
+        outcome = reconstruct_history(cfg, db_url, period=period, freq=freq)
+    if outcome is None:
+        console.print("[yellow]nothing to reconstruct — no positions, or no price history.")
+        return
+    rows, first, last = outcome
+    console.print(f"[green]wrote {rows} reconstructed points[/green] from {first} to {last}.")
+    console.print(
+        "[dim]These value today's units at past prices. They are a backtest of the "
+        "current book, not a record of what was held, and the chart labels them so."
+    )
 
 
 @app.command("build-lookthrough")

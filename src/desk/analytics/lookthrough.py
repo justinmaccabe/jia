@@ -33,12 +33,23 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-# How a fund's contents were determined. Only `securities` yields company-level
-# detail; the rest are honest labels for the cases that cannot.
+# How a fund's contents were determined. `securities` and `direct` yield
+# company-level detail; the rest are honest labels for the cases that cannot.
 SECURITIES = "securities"
+# A directly-held share is already a company and resolves to itself. Modelling it
+# this way is what lets a name owned outright *and* held inside a fund appear once
+# with both contributions summed — which is the overlap most easily missed, since
+# no statement shows it.
+DIRECT = "direct"
 SYNTHETIC = "synthetic"
 COMMODITY = "commodity"
 UNMAPPED = "unmapped"
+
+# Weight a fund's published list covers but which resolves to no security. Kept
+# distinct from cash: a fact sheet publishing its ten largest of five hundred
+# holdings leaves ~62% unaccounted for, and calling that cash would report a
+# diversified equity fund as mostly uninvested.
+UNRESOLVED = "Unresolved inside funds"
 
 EQUITY = "Equity"
 BOND = "Bond"
@@ -128,15 +139,25 @@ class FundComposition:
     # For a swap-based fund: the index it tracks, and where that index sits.
     tracks: str = ""
     region_mix: Mapping[str, float] = field(default_factory=dict)
+    # How many securities the fund actually holds, when the published list is only
+    # its largest few. None means the list is believed complete. This single field
+    # is what separates "the fund holds 2% cash" from "we can see 10 of its 506
+    # holdings", which are indistinguishable from the weights alone.
+    total_holdings: int | None = None
 
     @property
     def covered(self) -> float:
-        """Sum of published weights. Short of 1.0 means fund-level cash."""
+        """Sum of published weights."""
         return sum(h.weight for h in self.holdings)
 
     @property
+    def is_partial(self) -> bool:
+        """Whether the published list is known to be a subset of the fund."""
+        return self.total_holdings is not None and self.total_holdings > len(self.holdings)
+
+    @property
     def resolves_to_securities(self) -> bool:
-        return self.resolution == SECURITIES and bool(self.holdings)
+        return self.resolution in (SECURITIES, DIRECT) and bool(self.holdings)
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +203,8 @@ class LookThrough:
     stats: Concentration
     unresolved: Mapping[str, tuple[float, str]]
     as_of: dt.date | None
+    # fund -> (market value, holdings published, holdings the fund actually has)
+    partial: Mapping[str, tuple[float, int, int]] = field(default_factory=dict)
 
     @property
     def coverage(self) -> float:
@@ -191,6 +214,22 @@ class LookThrough:
     @property
     def is_empty(self) -> bool:
         return not self.companies
+
+    @property
+    def has_partial_funds(self) -> bool:
+        return bool(self.partial)
+
+    @property
+    def stats_are_lower_bounds(self) -> bool:
+        """Whether concentration figures understate the truth.
+
+        With any fund published only in part, every company total is a floor: the
+        named holdings are certainly there, and unseen ones may add more. The
+        distinct-securities count is the worst affected — ten of five hundred — and
+        the overlap figure is a floor too, since a company could be hiding in the
+        unpublished tail of a second fund. Read as "at least", never "exactly".
+        """
+        return self.has_partial_funds
 
 
 def _add(store: dict[str, float], key: str, amount: float) -> None:
@@ -217,6 +256,8 @@ def look_through(
     sector: dict[str, float] = {}
     asset: dict[str, float] = {}
     unresolved: dict[str, tuple[float, str]] = {}
+    # fund -> (market value, holdings published, holdings the fund actually has)
+    partial: dict[str, tuple[float, int, int]] = {}
     sector_base = 0.0
     resolved = 0.0
 
@@ -251,7 +292,13 @@ def look_through(
                 _add(asset, ASSET_LABELS[CASH], value)
             continue
 
-        resolved += value
+        # Only the published portion is resolved. For a complete list `covered` is
+        # ~1.0 and this is the whole position; for a top-ten-of-506 fact sheet it
+        # is about a third, and reporting the rest as resolved would overstate the
+        # coverage figure the entire tab is read against.
+        resolved += value * min(composition.covered, 1.0)
+        if composition.is_partial:
+            partial[fund] = (value, len(composition.holdings), composition.total_holdings or 0)
         equity_covered = 0.0
         for holding in composition.holdings:
             amount = value * holding.weight
@@ -267,11 +314,14 @@ def look_through(
                 _add(region, region_of(holding.country), amount)
             _add(asset, ASSET_LABELS.get(holding.asset_class, "Other"), amount)
         sector_base += equity_covered
-        # Published weights rarely sum to exactly one; the residual is the fund's
-        # own cash balance, and naming it keeps the asset mix summing to 100%.
+        # What the published weights do not cover. For a complete list this is the
+        # fund's own cash balance. For a partial list it is holdings we simply
+        # cannot see, and calling that cash would describe an equity fund as
+        # largely uninvested — so the two go to different buckets.
         residual = 1.0 - composition.covered
         if residual > 5e-4:
-            _add(asset, ASSET_LABELS[CASH], value * residual)
+            bucket = UNRESOLVED if composition.is_partial else ASSET_LABELS[CASH]
+            _add(asset, bucket, value * residual)
 
     exposures = tuple(
         sorted(
@@ -299,6 +349,7 @@ def look_through(
         stats=concentration(exposures, total),
         unresolved=unresolved,
         as_of=_earliest_as_of(compositions),
+        partial=partial,
     )
 
 

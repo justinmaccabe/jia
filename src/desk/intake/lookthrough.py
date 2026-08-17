@@ -37,6 +37,7 @@ from pathlib import Path
 
 from desk.analytics.lookthrough import (
     COMMODITY,
+    DIRECT,
     EQUITY,
     SECURITIES,
     SYNTHETIC,
@@ -138,10 +139,13 @@ class IntakeError(RuntimeError):
 
 @dataclass(frozen=True)
 class SourceSpec:
-    """One held fund and where its composition comes from.
+    """One held position and where its composition comes from.
 
-    `resolution` other than `securities` means no file is expected: the fund
-    cannot be looked through, and the reason is recorded instead.
+    Four shapes. A `file` names a full published holdings export. Inline
+    `holdings` carry a partial list transcribed from a fact sheet, which for some
+    providers is the only document published. `resolution: direct` marks a
+    directly-held share, which is already a company and needs no source at all.
+    Anything else — swap-based, commodity — expects no source and records a reason.
     """
 
     ticker: str
@@ -154,6 +158,14 @@ class SourceSpec:
     # A fund of one fund (a Canadian wrapper holding a US-listed ETF) resolves
     # through its underlying's file, so the file is named for the underlying.
     via: str = ""
+    # A partial list transcribed from a fact sheet, plus the fund's true holding
+    # count — that count is what tells the analytics layer the list is a subset,
+    # so the remainder is reported unresolved instead of counted as cash.
+    holdings: tuple[Mapping[str, object], ...] = ()
+    total_holdings: int | None = None
+    # For `direct`: the company's own classification.
+    sector: str = ""
+    country: str = ""
 
 
 def _norm_key(key: str) -> str:
@@ -251,19 +263,23 @@ def _title(text: str) -> str:
     return " ".join(w.capitalize() for w in text.split()) if text else ""
 
 
-def normalise(rows: Sequence[Holding], raw_total: float) -> tuple[Holding, ...]:
-    """Rescale weights to fractions of the fund.
+def normalise(
+    rows: Sequence[Holding], raw_total: float, *, rescale: bool = True
+) -> tuple[Holding, ...]:
+    """Convert weights to fractions of the fund.
 
-    A file quoting percentages sums to about a hundred; one quoting fractions
-    sums to about one. Both are accepted, and both are rescaled by the observed
-    total so the fund's cash residual is derived rather than inherited from a
-    rounding error.
+    With `rescale` (a complete holdings file), weights are divided by their own
+    total so they sum to one and the fund's cash residual falls out of the
+    arithmetic rather than out of a rounding error.
+
+    With `rescale=False` (a partial list — a fact sheet's ten largest of five
+    hundred), rescaling would be catastrophic: it would inflate a 37.9% slice into
+    the whole fund and silently claim complete knowledge of it. Units are converted
+    and nothing else. A total above 2 is read as percentages, below as fractions.
     """
     if raw_total <= 0:
         return ()
-    # Cap at 1.0: the residual (fund cash) is computed by the analytics layer as
-    # 1 - covered, and a file summing to 100.4% must not yield a negative one.
-    scale = 1.0 / raw_total
+    scale = (1.0 / raw_total) if rescale else (0.01 if raw_total > 2 else 1.0)
     return tuple(
         Holding(
             ticker=h.ticker,
@@ -288,6 +304,60 @@ def build(
     """
     out: list[FundComposition] = []
     for spec in specs:
+        # A directly-held share resolves to itself at full weight. Complete by
+        # construction, so no total_holdings and no unresolved remainder.
+        if spec.resolution == DIRECT:
+            out.append(
+                FundComposition(
+                    ticker=spec.ticker,
+                    name=spec.name,
+                    resolution=DIRECT,
+                    as_of=as_of,
+                    note=spec.note or "held directly",
+                    holdings=(
+                        Holding(
+                            ticker=spec.ticker,
+                            name=spec.name or spec.ticker,
+                            weight=1.0,
+                            asset_class=EQUITY,
+                            sector=spec.sector,
+                            country=spec.country,
+                        ),
+                    ),
+                )
+            )
+            continue
+
+        # A partial list transcribed from a fact sheet. Weights are NOT rescaled:
+        # the ten largest of five hundred must stay a third of the fund, not become
+        # all of it.
+        if spec.holdings:
+            rows = tuple(
+                Holding(
+                    ticker=str(h.get("ticker", "")).upper(),
+                    name=str(h.get("name") or h.get("ticker") or ""),
+                    weight=float(h["weight"]),  # type: ignore[arg-type]
+                    asset_class=str(h.get("asset_class", EQUITY)),
+                    sector=str(h.get("sector", "")),
+                    country=str(h.get("country", "")),
+                )
+                for h in spec.holdings
+            )
+            raw_total = sum(h.weight for h in rows)
+            complete = spec.total_holdings is None or spec.total_holdings <= len(rows)
+            out.append(
+                FundComposition(
+                    ticker=spec.ticker,
+                    name=spec.name,
+                    resolution=SECURITIES,
+                    as_of=as_of,
+                    holdings=normalise(rows, raw_total, rescale=complete),
+                    note=spec.note,
+                    total_holdings=spec.total_holdings,
+                )
+            )
+            continue
+
         if spec.resolution != SECURITIES:
             out.append(
                 FundComposition(
@@ -337,6 +407,7 @@ def to_json(compositions: Sequence[FundComposition]) -> str:
                     "as_of": c.as_of.isoformat() if c.as_of else None,
                     "note": c.note,
                     "tracks": c.tracks,
+                    "total_holdings": c.total_holdings,
                     "region_mix": dict(c.region_mix),
                     "holdings": [
                         {
@@ -376,6 +447,7 @@ def from_json(payload: str) -> tuple[FundComposition, ...]:
                 as_of=dt.date.fromisoformat(raw_date) if raw_date else None,
                 note=fund.get("note", ""),
                 tracks=fund.get("tracks", ""),
+                total_holdings=fund.get("total_holdings"),
                 region_mix=fund.get("region_mix") or {},
                 holdings=tuple(
                     Holding(
@@ -426,10 +498,22 @@ def specs_from_yaml(text: str) -> tuple[SourceSpec, ...]:
         if not isinstance(entry, dict) or "ticker" not in entry:
             raise IntakeError(f"each fund needs a 'ticker': got {entry!r}")
         resolution = entry.get("resolution", SECURITIES)
-        if resolution not in (SECURITIES, SYNTHETIC, COMMODITY):
+        if resolution not in (SECURITIES, DIRECT, SYNTHETIC, COMMODITY):
             raise IntakeError(
                 f"{entry['ticker']}: resolution must be one of "
-                f"{SECURITIES}, {SYNTHETIC}, {COMMODITY} (got {resolution!r})"
+                f"{SECURITIES}, {DIRECT}, {SYNTHETIC}, {COMMODITY} (got {resolution!r})"
+            )
+        inline = tuple(entry.get("holdings") or ())
+        total = entry.get("total_holdings")
+        # A partial list without a holding count would be indistinguishable from a
+        # complete one, and the remainder would be reported as fund cash. Refuse it
+        # rather than produce a look-through that is quietly wrong.
+        if inline and total is None:
+            raise IntakeError(
+                f"{entry['ticker']}: inline holdings need `total_holdings` — the number the "
+                "fund actually holds. Without it a partial list cannot be told from a "
+                "complete one, and the unpublished remainder would be counted as cash. "
+                f"Set it equal to {len(inline)} if this list really is the whole fund."
             )
         out.append(
             SourceSpec(
@@ -441,6 +525,10 @@ def specs_from_yaml(text: str) -> tuple[SourceSpec, ...]:
                 tracks=entry.get("tracks", ""),
                 region_mix=entry.get("region_mix") or {},
                 via=entry.get("via", ""),
+                holdings=inline,
+                total_holdings=int(total) if total is not None else None,
+                sector=entry.get("sector", ""),
+                country=entry.get("country", ""),
             )
         )
     return tuple(out)

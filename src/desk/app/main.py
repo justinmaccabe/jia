@@ -146,7 +146,10 @@ def main() -> None:
     db_url = settings.database_url.get_secret_value() if settings.database_url else None
     with tabs[0]:
         _overview(cfg, result, cash, is_demo=is_demo)
+        # Performance above the per-holding tables: it is the thing most people
+        # open the dashboard for, and it used to sit below both of them.
         _performance(cfg, db_url)
+        _positions_tables(cfg, result)
     with tabs[2]:
         _analytics(cfg, result)
     with tabs[3]:
@@ -200,6 +203,20 @@ def _overview(
         st.caption(note)
 
     _allocation(cfg, result, rolled)
+
+
+def _positions_tables(cfg: PortfolioConfig, result: LedgerResult | None) -> None:
+    """Holding-by-holding detail, below the summary and the performance chart.
+
+    Split out so the performance history sits above two long tables rather than
+    beneath them. It was the last element on the tab, which put the chart most
+    people open the dashboard to see off the bottom of the screen.
+    """
+    if result is None or not result.positions:
+        return
+    rolled = aggregate_by_ticker(result.positions)
+    total_book = sum(p.book_value_base for p in rolled)
+    ccy = cfg.locale.base_currency
 
     frame = pd.DataFrame(
         [
@@ -312,7 +329,7 @@ def _allocation(cfg: PortfolioConfig, result: LedgerResult, rolled: Sequence[Pos
             sort=False,
             marker={
                 "colors": [palette[i % len(palette)] for i in range(len(ordered))],
-                "line": {"color": "#221C20", "width": 1},
+                "line": {"color": b.primary, "width": 1},
             },
             textinfo="label+percent",
             textfont={"family": b.serif, "size": 12},
@@ -324,7 +341,7 @@ def _allocation(cfg: PortfolioConfig, result: LedgerResult, rolled: Sequence[Pos
         margin={"l": 8, "r": 8, "t": 8, "b": 8},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font={"family": b.serif, "color": "#DED8CE"},
+        font={"family": b.serif, "color": b.ink, "size": 13},
         showlegend=False,
         annotations=[
             {
@@ -332,7 +349,7 @@ def _allocation(cfg: PortfolioConfig, result: LedgerResult, rolled: Sequence[Pos
                 "x": 0.5,
                 "y": 0.5,
                 "showarrow": False,
-                "font": {"family": b.serif, "size": 17, "color": "#DED8CE"},
+                "font": {"family": b.serif, "size": 17, "color": b.ink},
             }
         ],
     )
@@ -361,7 +378,7 @@ def _allocation(cfg: PortfolioConfig, result: LedgerResult, rolled: Sequence[Pos
             margin={"l": 8, "r": 8, "t": 8, "b": 8},
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            font={"family": b.serif, "color": "#DED8CE"},
+            font={"family": b.serif, "color": b.ink, "size": 13},
             xaxis={"gridcolor": GRID_COLOUR, "tickformat": ",.0f", "title": ccy},
             yaxis={"showgrid": False},
         )
@@ -505,6 +522,15 @@ def _instrument_maps(
     return instrument_maps(cfg.instruments, [p.ticker for p in result.positions])
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_comparators(
+    comparators: tuple[tuple[str, str, str], ...], base: str
+) -> dict[str, pd.Series]:
+    from desk.services.market import comparator_history
+
+    return comparator_history(comparators, base)
+
+
 def _performance(cfg: PortfolioConfig, db_url: str | None) -> None:
     """Fetch prices, record a snapshot, and chart the recorded history."""
     import plotly.graph_objects as go
@@ -535,13 +561,22 @@ def _performance(cfg: PortfolioConfig, db_url: str | None) -> None:
     if snaps.empty:
         st.markdown(
             '<p class="note">No snapshots yet. Press <em>Fetch prices</em> to record '
-            "the first one.</p>",
+            "the first one, or run <code>desk backfill-snapshots</code> to fill the "
+            "chart from price history straight away.</p>",
             unsafe_allow_html=True,
         )
         return
 
-    closes = snaps[snaps["slot"] == "close"]
-    series = closes if not closes.empty else snaps
+    from desk.analytics.risk import rebase
+    from desk.services.market import RECONSTRUCTED
+
+    # Reconstructed points value today's units at past prices. They are a backtest
+    # of the current book, not observations, so they are drawn as their own series
+    # and never merged into the recorded one.
+    history = snaps[snaps["slot"] == RECONSTRUCTED].sort_values("date")
+    recorded = snaps[snaps["slot"] != RECONSTRUCTED]
+    closes = recorded[recorded["slot"] == "close"]
+    series = closes if not closes.empty else recorded
     labels = [d.strftime("%b %d") for d in pd.to_datetime(series["date"])]
     ccy = cfg.locale.base_currency
     # One recorded point draws an invisible line, so markers carry the series
@@ -549,6 +584,60 @@ def _performance(cfg: PortfolioConfig, db_url: str | None) -> None:
     sparse = len(series) < 2
     mode = "markers" if sparse else "lines+markers"
     fig = go.Figure()
+    overlaid: list[str] = []
+    if not history.empty:
+        history_dates = pd.to_datetime(history["date"])
+        fig.add_trace(
+            go.Scatter(
+                x=[d.strftime("%b %d") for d in history_dates],
+                y=history["market_value"],
+                mode="lines",
+                name="This portfolio",
+                # The hero series: brightest colour, and clearly the thickest line
+                # on the chart. Dashed still carries "reconstructed, not observed",
+                # but weight and brightness say "read this one first".
+                line={"color": b.accent, "width": 3.0, "dash": "dash"},
+                hovertemplate="<b>%{y:,.0f} " + ccy + "</b><extra>Portfolio</extra>",
+            )
+        )
+        # Comparators are rebased to the reconstructed series' own starting value, so
+        # the question they answer is "what would the same money have become". That
+        # comparison is fair precisely because the reconstruction holds units
+        # constant: both sides are buy-and-hold from the same date, with no
+        # contributions on either.
+        start_value = float(history["market_value"].iloc[0])
+        # Benchmarks share one hue, separated from each other by dash pattern and
+        # opacity rather than by a second and third colour. Three lines in three
+        # shades of one palette is what made this unreadable; a portfolio and the
+        # things it is measured against are two categories, not three peers.
+        dashes = ("dot", "longdash", "dashdot")
+        for index, (label, prices) in enumerate(
+            _cached_comparators(
+                tuple((c.label, c.symbol, c.currency or "") for c in cfg.benchmarks.comparators),
+                ccy,
+            ).items()
+        ):
+            aligned = rebase(prices.reindex(history_dates).ffill().dropna(), start_value)
+            if aligned.empty:
+                continue
+            overlaid.append(label)
+            fig.add_trace(
+                go.Scatter(
+                    x=[d.strftime("%b %d") for d in pd.DatetimeIndex(aligned.index)],
+                    y=aligned.to_numpy(),
+                    mode="lines",
+                    name=label,
+                    line={
+                        "color": b.benchmark,
+                        "width": 1.7,
+                        "dash": dashes[index % len(dashes)],
+                    },
+                    opacity=1.0 - 0.25 * index,
+                    hovertemplate="%{y:,.0f} "
+                    + ccy
+                    + f"<extra>{label} — same starting amount</extra>",
+                )
+            )
     fig.add_trace(
         go.Scatter(
             x=labels,
@@ -575,26 +664,78 @@ def _performance(cfg: PortfolioConfig, db_url: str | None) -> None:
             hovertemplate="%{x}: %{y:,.0f} " + ccy + "<extra>Book value</extra>",
         )
     )
+    # A category axis prints every label, which at weekly sampling over eighteen
+    # months is roughly eighty of them overlapping into a grey band. Thin to a
+    # readable number and let plotly space them evenly.
+    tick_count = max(len(labels), len(history))
     fig.update_layout(
-        height=320,
-        margin={"l": 8, "r": 8, "t": 8, "b": 8},
+        height=440,
+        margin={"l": 8, "r": 8, "t": 44, "b": 8},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font={"family": b.serif, "color": "#DED8CE"},
-        xaxis={"type": "category", "showgrid": False},
-        yaxis={"gridcolor": GRID_COLOUR, "tickformat": ",.0f", "title": ccy},
-        legend={"orientation": "h", "y": 1.12, "x": 0},
+        font={"family": b.serif, "color": b.ink, "size": 13},
+        xaxis={
+            "type": "category",
+            "showgrid": False,
+            "nticks": 8,
+            "tickangle": 0,
+            "tickfont": {"size": 12},
+        },
+        yaxis={
+            "gridcolor": GRID_COLOUR,
+            "tickformat": ",.0f",
+            "title": None,
+            "ticksuffix": f"  {ccy}",
+            "tickfont": {"size": 12},
+        },
+        # Hover on the nearest x across every series at once, so the portfolio and
+        # its benchmarks are read together rather than one at a time.
+        hovermode="x unified",
+        hoverlabel={"font": {"family": b.serif, "size": 13}},
+        legend={
+            "orientation": "h",
+            "y": 1.14,
+            "x": 0,
+            "font": {"size": 13},
+            "itemwidth": 40,
+        },
     )
+    if tick_count > 40:
+        fig.update_xaxes(nticks=6)
     st.plotly_chart(fig, use_container_width=True)
+    if not history.empty:
+        st.markdown(
+            '<p class="note">The dashed line is <strong>reconstructed</strong>: the units '
+            "held today, valued at the prices of each past date. It is a backtest of the "
+            "current book, not a record of it — a position opened last month is projected "
+            "backwards as though it had always been there, and contributions are invisible. "
+            "Solid markers are real recorded snapshots. Only those carry book value, which "
+            "is why the reconstructed line has no companion.</p>",
+            unsafe_allow_html=True,
+        )
+    if overlaid:
+        st.markdown(
+            f'<p class="note">Dotted lines are <strong>{" and ".join(overlaid)}</strong>, '
+            "each started at the same amount on the same date, so the gap is the "
+            "difference in return rather than in size. The comparison is a fair one "
+            "here because both sides are buy-and-hold from that date — once recorded "
+            "snapshots include contributions, a like-for-like comparison needs a "
+            "money-weighted return instead.</p>",
+            unsafe_allow_html=True,
+        )
     if sparse:
         st.markdown(
             '<p class="note">One recorded point so far, shown as markers — the gap '
-            "between them is the unrealized gain. Press <em>Fetch prices</em> again "
-            "on later days and the lines join up into a history.</p>",
+            "between them is the unrealized gain. Once the daily job has run a few "
+            "times the recorded series joins up into a history of its own.</p>",
             unsafe_allow_html=True,
         )
 
-    _open_close_table(snaps, ccy)
+    # Recorded rows only. The reconstructed series has no open/close distinction,
+    # so passing it here would add a row per reconstructed date with both columns
+    # empty — dozens of blank lines above the handful of real ones.
+    if not recorded.empty:
+        _open_close_table(recorded, ccy)
 
 
 def _record_now(cfg: PortfolioConfig, db_url: str) -> None:
@@ -719,10 +860,13 @@ def _correlations(cfg: PortfolioConfig, result: LedgerResult | None) -> None:
             y=labels[1:],
             zmin=0,
             zmax=1,
-            colorscale=[[0.0, "#2C242A"], [0.5, "#8C6A75"], [1.0, b.primary]],
+            # Two plain-hex stops from the configured palette. A sequential ramp in
+            # one hue is the right encoding for a magnitude, and plotly rejects both
+            # eight-digit hex and a transparent stop here.
+            colorscale=[[0.0, b.primary], [1.0, b.accent]],
             text=text,
             texttemplate="%{text}",
-            textfont={"size": 12, "color": "#DED8CE"},
+            textfont={"size": 12, "color": b.ink},
             hoverongaps=False,
             showscale=False,
             hovertemplate="%{y} x %{x}: %{z:.2f}<extra></extra>",
@@ -733,7 +877,7 @@ def _correlations(cfg: PortfolioConfig, result: LedgerResult | None) -> None:
         margin={"l": 8, "r": 8, "t": 8, "b": 8},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font={"family": b.serif, "color": "#DED8CE"},
+        font={"family": b.serif, "color": b.ink, "size": 13},
         yaxis={"autorange": "reversed"},
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -793,15 +937,42 @@ def _holdings_xray(cfg: PortfolioConfig, result: LedgerResult | None) -> None:
     # resolved sleeve, and the reader needs to know how big that sleeve is before
     # reading them.
     if report.coverage < 0.999:
-        rows = " · ".join(
-            f"<strong>{t}</strong> {v:,.0f} {ccy} ({why})"
-            for t, (v, why) in sorted(report.unresolved.items(), key=lambda kv: -kv[1][0])
-        )
+        parts: list[str] = []
+        if report.unresolved:
+            parts.append(
+                "Holding no securities to resolve: "
+                + " · ".join(
+                    f"<strong>{t}</strong> {v:,.0f} {ccy} ({why})"
+                    for t, (v, why) in sorted(report.unresolved.items(), key=lambda kv: -kv[1][0])
+                )
+            )
+        if report.partial:
+            parts.append(
+                "Published in part only, so the rest of each is unseen rather than "
+                "absent: "
+                + " · ".join(
+                    f"<strong>{t}</strong> {shown} of {held:,}"
+                    for t, (_, shown, held) in sorted(
+                        report.partial.items(), key=lambda kv: -kv[1][0]
+                    )
+                )
+            )
         st.markdown(
             f'<p class="note">Security detail covers <strong>{report.coverage:.0%}</strong> '
-            f"of the portfolio. The rest holds no securities to resolve and is excluded "
-            f"from the company, sector and concentration figures below rather than "
-            f"diluted into them: {rows}.</p>",
+            f"of the portfolio. Everything else is excluded from the company, sector and "
+            f"concentration figures below rather than diluted into them. "
+            + ". ".join(parts)
+            + ".</p>",
+            unsafe_allow_html=True,
+        )
+    if report.stats_are_lower_bounds:
+        st.markdown(
+            '<p class="note">Because some funds publish only their largest holdings, '
+            "every figure here is a <em>floor</em>. A company shown at 2% holds at least "
+            "2%; it may also sit in the unpublished tail of another fund. Overlap counts "
+            "understate for the same reason — the doubling shown is real, and there is "
+            "likely more of it. Supplying full holdings files turns these into exact "
+            "figures.</p>",
             unsafe_allow_html=True,
         )
 
@@ -822,14 +993,15 @@ def _holdings_xray(cfg: PortfolioConfig, result: LedgerResult | None) -> None:
         help=f"{top.total:,.0f} {ccy}, arriving through {top.funds} "
         f"{'fund' if top.funds == 1 else 'separate funds'}.",
     )
-    bb.metric("Top 10 companies", f"{s.top10:.1%}")
-    c.metric("Distinct securities", f"{s.distinct:,}")
+    floor = "at least " if report.stats_are_lower_bounds else ""
+    bb.metric("Top 10 companies", f"{floor}{s.top10:.1%}")
+    c.metric("Companies seen", f"{floor}{s.distinct:,}")
     d.metric(
-        "Held via 3+ funds",
-        f"{s.overlap_3plus:.1%}",
-        help="Share of the portfolio sitting in companies delivered by three or more "
-        "of your funds at once. This is the concentration a fund-level allocation "
-        "chart cannot show.",
+        "Held via 2+ sources",
+        f"{floor}{sum(x.total for x in report.companies if x.funds >= 2) / report.total:.1%}",
+        help="Share of the portfolio in companies arriving through more than one "
+        "holding at once — a fund and a direct position, or two funds. This is the "
+        "concentration a fund-level allocation chart cannot show.",
     )
 
     st.markdown(
@@ -868,7 +1040,7 @@ def _holdings_xray(cfg: PortfolioConfig, result: LedgerResult | None) -> None:
         margin={"l": 8, "r": 8, "t": 8, "b": 8},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font={"family": b.serif, "color": "#DED8CE"},
+        font={"family": b.serif, "color": b.ink, "size": 13},
         xaxis={"gridcolor": GRID_COLOUR, "tickformat": ",.0f", "title": ccy},
         yaxis={"showgrid": False},
         legend={"orientation": "h", "y": 1.04, "x": 0},
@@ -977,7 +1149,7 @@ def _donut(cfg: PortfolioConfig, shares: Mapping[str, float], ccy: str) -> None:
         margin={"l": 8, "r": 8, "t": 8, "b": 8},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font={"family": b.serif, "color": "#DED8CE"},
+        font={"family": b.serif, "color": b.ink, "size": 13},
         showlegend=False,
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -1011,7 +1183,7 @@ def _sector_bars(cfg: PortfolioConfig, shares: Mapping[str, float]) -> None:
         margin={"l": 8, "r": 8, "t": 8, "b": 8},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font={"family": b.serif, "color": "#DED8CE"},
+        font={"family": b.serif, "color": b.ink, "size": 13},
         xaxis={"gridcolor": GRID_COLOUR, "tickformat": ".0%"},
         yaxis={"showgrid": False},
     )
@@ -1054,12 +1226,19 @@ def _asset_bar(cfg: PortfolioConfig, shares: Mapping[str, float]) -> None:
         margin={"l": 8, "r": 8, "t": 8, "b": 8},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font={"family": b.serif, "color": "#DED8CE"},
+        font={"family": b.serif, "color": b.ink, "size": 13},
         xaxis={"tickformat": ".0%", "range": [0, 1], "gridcolor": GRID_COLOUR},
         yaxis={"showticklabels": False, "showgrid": False},
         legend={"orientation": "h", "y": -0.3, "x": 0},
     )
     st.plotly_chart(fig, use_container_width=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_factor_frame(provider_name: str, cache_dir: str) -> pd.DataFrame:
+    from desk.services.factors import load_factors
+
+    return load_factors(provider_name, cache_dir or None)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1157,7 +1336,7 @@ def _factor_exposure(cfg: PortfolioConfig, result: LedgerResult | None) -> None:
         margin={"l": 8, "r": 8, "t": 20, "b": 8},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font={"family": b.serif, "color": "#DED8CE"},
+        font={"family": b.serif, "color": b.ink, "size": 13},
         xaxis={"showgrid": False},
         yaxis={"gridcolor": GRID_COLOUR, "title": "Loading (beta)", "zerolinecolor": "#5A4A50"},
     )
@@ -1282,7 +1461,20 @@ def _risk(cfg: PortfolioConfig, result: LedgerResult | None) -> None:
     # Current units held constant over history: a like-for-like backtest of the
     # book as it stands today, not a replay of when each lot was bought.
     values = (history[columns] * pd.Series({c: units[c] for c in columns})).sum(axis=1)
-    stats = risk_stats(values.dropna(), benchmark)
+    # A zero risk-free rate turns every Sharpe-family ratio from an excess return
+    # into a total return, which overstates them by roughly the cash rate over
+    # volatility. The config already asks for the Ken French RF series; this uses it.
+    rf = 0.0
+    if cfg.risk.risk_free == "kenfrench_rf" and cfg.data.factor_provider != "none":
+        from desk.analytics.risk import annual_risk_free
+
+        try:
+            rf = annual_risk_free(
+                _cached_factor_frame(cfg.data.factor_provider, cfg.data.cache_dir)
+            )
+        except Exception:
+            rf = 0.0
+    stats = risk_stats(values.dropna(), benchmark, risk_free_rate=rf)
 
     if stats.periods < 6:
         st.markdown(
@@ -1334,12 +1526,19 @@ def _risk(cfg: PortfolioConfig, result: LedgerResult | None) -> None:
         ("Positive periods", stats.positive_periods),
         ("Gain/loss ratio", stats.gain_loss_ratio),
     ]
+    from desk.analytics.risk import METRIC_BASIS, UNITLESS
+
     formatted = [
         {
             "Metric": label,
             "Value": (
                 "—" if value is None else (f"{value:.2%}" if label in pct else f"{value:.2f}")
             ),
+            # Stated per row rather than in a footnote. Twelve of these are
+            # annualised and three are not, and under bare labels a monthly 5% VaR
+            # reads as an annual one — an understatement of roughly three and a half
+            # times, in the direction that makes a portfolio look safer.
+            "Basis": METRIC_BASIS.get(label, UNITLESS),
         }
         for label, value in rows
     ]
@@ -1348,10 +1547,27 @@ def _risk(cfg: PortfolioConfig, result: LedgerResult | None) -> None:
     left.dataframe(pd.DataFrame(formatted[:half]), width="stretch", hide_index=True)
     right.dataframe(pd.DataFrame(formatted[half:]), width="stretch", hide_index=True)
     bench_note = f" against {bench_symbol}" if bench_symbol else " (no benchmark configured)"
+    rf_note = (
+        f"Excess returns are measured over a {rf:.2%} annual risk-free rate, taken from "
+        "the factor library's own cash series."
+        if rf > 0
+        else "The risk-free rate is zero, so the Sharpe family are total-return ratios "
+        "rather than excess-return ones and read high."
+    )
     st.markdown(
         f'<p class="note">Monthly returns over {stats.periods} periods{bench_note}, in '
-        f"{base}, holding current units constant. Statistics that need more history than "
-        "is available are left blank rather than estimated.</p>",
+        f"{base}, holding current units constant. {rf_note} Statistics needing more "
+        "history than is available are left blank rather than estimated.</p>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<p class="note"><strong>Value at risk is left at its monthly horizon on '
+        "purpose.</strong> Scaling a tail quantile to a year by the square root of "
+        "twelve assumes returns are independent and normally distributed — which is "
+        "the assumption a tail statistic exists to test, so the annualised figure "
+        "would be least reliable in exactly the conditions it gets consulted for. "
+        "Maximum drawdown is likewise the worst decline actually observed; scaling it "
+        "would describe a loss nobody suffered.</p>",
         unsafe_allow_html=True,
     )
 

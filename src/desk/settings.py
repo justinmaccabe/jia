@@ -19,9 +19,8 @@ from __future__ import annotations
 import os
 from enum import StrEnum
 from functools import lru_cache
-from typing import Any
 
-from pydantic import Field, SecretStr, ValidationError, model_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -76,6 +75,30 @@ class Settings(BaseSettings):
 
     login_max_attempts: int = Field(default=5, ge=1, le=100)
     login_window_minutes: int = Field(default=15, ge=1, le=1440)
+
+    @field_validator(
+        "database_url",
+        "passcode_hash",
+        "session_secret",
+        "oidc_client_id",
+        "oidc_client_secret",
+        "config_path",
+        mode="before",
+    )
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        """An empty value means absent, not present-and-empty.
+
+        GitHub Actions interpolates a missing secret as an empty string rather than
+        leaving the variable unset, so `${{ secrets.MISSING }}` arrives as "". That
+        made `database_url` a SecretStr("") — not None, so an `is None` guard passed
+        it straight through to the engine, which then failed several frames deeper
+        with a message about hosted deployments losing their history.
+
+        Normalising here rather than at each call site means the environment
+        boundary owns the distinction, and every consumer can trust `is None`.
+        """
+        return None if isinstance(value, str) and not value.strip() else value
 
     @property
     def allowed_email_set(self) -> frozenset[str]:
@@ -150,27 +173,69 @@ def _looks_like_demo_database(url: str) -> bool:
     return "demo" in lowered or lowered.startswith("sqlite:///:memory:")
 
 
-def _load_streamlit_secrets_into_env() -> None:
+def _load_streamlit_secrets_into_env() -> str | None:
     """Copy Streamlit's secret store into the environment, once, before settings
-    are constructed.
+    are constructed. Returns a diagnostic when the store could not be read.
 
     This is the single place the codebase knows Streamlit exists as a secret
     source. Everything downstream reads plain environment variables, which keeps
     it testable and portable off Streamlit Cloud.
+
+    The return value exists because swallowing a failure here produces an
+    actively misleading error. A single malformed line in the secrets box makes
+    Streamlit raise on the *whole* store, so nothing loads, and the app then
+    reports the first required variable as unset — sending the reader off to add
+    a value that is already there. The reason has to travel to the surface.
     """
     try:
         import streamlit as st
-
-        secrets: Any = st.secrets
     except Exception:
-        return
+        return None  # not running under Streamlit; the environment is the source
     try:
-        items = list(secrets.items())
-    except Exception:
-        return
+        items = list(st.secrets.items())
+    except Exception as exc:
+        # No secrets file at all is the normal case for CLI use and for `desk
+        # demo`, so it is not a fault and must not be reported as one — doing so
+        # appends a spurious "could not be read" to every local error message.
+        # Only a store that exists but cannot be parsed is worth surfacing.
+        if _is_absent_rather_than_broken(exc):
+            return None
+        detail = str(exc).strip().splitlines()
+        first = detail[0] if detail else type(exc).__name__
+        return (
+            f"Streamlit's secret store could not be read ({type(exc).__name__}: {first}). "
+            "Every value in it is therefore unavailable, including any that are "
+            "correctly set. This is usually a syntax error in the secrets box: each "
+            'entry must be KEY = "value" on a single line.'
+        )
     for key, value in items:
         if isinstance(value, str) and key not in os.environ:
             os.environ[key] = value
+    return None
+
+
+def _is_absent_rather_than_broken(exc: BaseException) -> bool:
+    """Whether the secret store is simply missing, as opposed to unparsable.
+
+    Matched on the exception's class name rather than by importing Streamlit's
+    exception types, which keeps this module free of a hard dependency on their
+    internals. If they rename it the check degrades to reporting a missing store
+    as a problem — noisy, but never wrong about a real parse failure.
+    """
+    return type(exc).__name__ == "StreamlitSecretNotFoundError" or str(exc).lstrip().startswith(
+        "No secrets found"
+    )
+
+
+def _visible_keys() -> tuple[str, ...]:
+    """Names of DESK_* variables that did arrive. Names only, never values.
+
+    Printed when configuration fails so the reader can see what the process
+    actually received rather than inferring it. Seeing DESK_DATABASE_URL listed
+    and DESK_AUTH_MODE absent settles in one glance what no amount of re-reading
+    the secrets box will.
+    """
+    return tuple(sorted(k for k in os.environ if k.startswith("DESK_")))
 
 
 @lru_cache(maxsize=1)
@@ -180,7 +245,7 @@ def get_settings() -> Settings:
     Raises SettingsError on anything invalid. Callers must not catch this and
     continue — the app is expected to refuse to start.
     """
-    _load_streamlit_secrets_into_env()
+    store_problem = _load_streamlit_secrets_into_env()
     try:
         return Settings()  # type: ignore[call-arg]
     except ValidationError as exc:
@@ -191,4 +256,19 @@ def get_settings() -> Settings:
                 lines.append(f"  DESK_{location.upper()} is required and was not set")
             else:
                 lines.append(f"  {location}: {err['msg']}")
+
+        # The likely root cause, when there is one, outranks the symptom above.
+        if store_problem is not None:
+            lines += ["", f"Probable cause: {store_problem}"]
+
+        seen = _visible_keys()
+        lines += [
+            "",
+            f"DESK_* variables the app can see: {', '.join(seen) if seen else '(none)'}",
+        ]
+        if not seen:
+            lines.append(
+                "  None arrived at all. Either the secrets box is empty, it failed to "
+                "parse, or this is a different app than the one you edited."
+            )
         raise SettingsError("\n".join(lines)) from exc

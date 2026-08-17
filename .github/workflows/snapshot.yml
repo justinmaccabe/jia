@@ -57,6 +57,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e '.[prices,postgres]'
 
+      - name: The database secret must be set
+        # A missing secret interpolates as an empty string rather than failing, so
+        # without this the job proceeds and dies later inside the engine. Checked
+        # here so the log names the setting and where to change it.
+        env:
+          DESK_DATABASE_URL: ${{ secrets.DESK_DATABASE_URL }}
+        run: |
+          if [ -z "$DESK_DATABASE_URL" ]; then
+            echo "::error::DESK_DATABASE_URL is empty. Add it under Settings ->" \
+                 "Secrets and variables -> Actions -> New repository secret," \
+                 "using the same connection string the dashboard uses."
+            exit 1
+          fi
+          echo "secret is present"
+
       - name: Record snapshot
         env:
           # auth_mode is required with no default and has no meaning for a
